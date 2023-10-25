@@ -24,8 +24,8 @@ define allow-override
     $(eval $(1) = $(2)))
 endef
 
-$(call allow-override,CC,$(CROSS_COMPILE)cc)
-$(call allow-override,LD,$(CROSS_COMPILE)ld)
+$(call allow-override,CC,aarch64-linux-gnu-gcc)
+$(call allow-override,LD,aarch64-linux-gnu-ld)
 
 TOPDIR = ..
 
@@ -42,7 +42,7 @@ ALL_CFLAGS += $(CFLAGS) 						\
 ALL_LDFLAGS += $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 ifdef NO_PKG_CONFIG
-	ALL_LDFLAGS += -lelf -lz
+	ALL_LDFLAGS += -L../../deps/libelf-aarch64/usr/lib -lelf -L../../deps/zlib-1.2.10 -lz
 else
 	PKG_CONFIG ?= pkg-config
 	ALL_CFLAGS += $(shell $(PKG_CONFIG) --cflags libelf zlib)
