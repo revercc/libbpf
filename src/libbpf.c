@@ -45,6 +45,10 @@
 #include <libelf.h>
 #include <gelf.h>
 #include <zlib.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <linux/un.h>
 
 #include "libbpf.h"
 #include "bpf.h"
@@ -12438,6 +12442,7 @@ struct perf_buffer_params {
 	int cpu_cnt;
 	int *cpus;
 	int *map_keys;
+	__u32 unwind_call_stack;
 };
 
 struct perf_cpu_buf {
@@ -12463,6 +12468,7 @@ struct perf_buffer {
 	int cpu_cnt; /* number of allocated CPU buffers */
 	int epoll_fd; /* perf event FD */
 	int map_fd; /* BPF_MAP_TYPE_PERF_EVENT_ARRAY BPF map FD */
+	__u32 unwind_call_stack;
 };
 
 static void perf_buffer__free_cpu_buf(struct perf_buffer *pb,
@@ -12568,6 +12574,7 @@ struct perf_buffer *perf_buffer__new(int map_fd, size_t page_cnt,
 	struct perf_buffer_params p = {};
 	struct perf_event_attr attr;
 	__u32 sample_period;
+	__u32 unwind_call_stack;
 
 	if (!OPTS_VALID(opts, perf_buffer_opts))
 		return libbpf_err_ptr(-EINVAL);
@@ -12580,10 +12587,18 @@ struct perf_buffer *perf_buffer__new(int map_fd, size_t page_cnt,
 	attr.size = attr_sz;
 	attr.config = PERF_COUNT_SW_BPF_OUTPUT;
 	attr.type = PERF_TYPE_SOFTWARE;
-	attr.sample_type = PERF_SAMPLE_RAW;
+	attr.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_TID;
 	attr.sample_period = sample_period;
 	attr.wakeup_events = sample_period;
 
+	unwind_call_stack = OPTS_GET(opts, unwind_call_stack, 0);
+	if(unwind_call_stack == 1){
+		attr.sample_type |= PERF_SAMPLE_STACK_USER | PERF_SAMPLE_REGS_USER;
+		attr.sample_stack_user = 16384; // MAX=65528
+		attr.sample_regs_user = ((1ULL << 33) - 1);
+	}
+
+	p.unwind_call_stack = unwind_call_stack;
 	p.attr = &attr;
 	p.sample_cb = sample_cb;
 	p.lost_cb = lost_cb;
@@ -12660,6 +12675,7 @@ static struct perf_buffer *__perf_buffer__new(int map_fd, size_t page_cnt,
 	if (!pb)
 		return ERR_PTR(-ENOMEM);
 
+	pb->unwind_call_stack = p->unwind_call_stack;
 	pb->event_cb = p->event_cb;
 	pb->sample_cb = p->sample_cb;
 	pb->lost_cb = p->lost_cb;
@@ -12763,10 +12779,33 @@ error:
 	return ERR_PTR(err);
 }
 
+// struct {
+//     struct perf_event_header header;
+//     u32    size;               /* if PERF_SAMPLE_RAW */
+//     char   data[size];         /* if PERF_SAMPLE_RAW */
+//     u64    abi;                /* if PERF_SAMPLE_REGS_USER */
+//     u64    regs[weight(mask)]; /* if PERF_SAMPLE_REGS_USER */
+//     u64    size;               /* if PERF_SAMPLE_STACK_USER */
+//     char   data[size];         /* if PERF_SAMPLE_STACK_USER */
+//     u64    dyn_size;           /* if PERF_SAMPLE_STACK_USER && size != 0 */
+// };
+
 struct perf_sample_raw {
 	struct perf_event_header header;
+	uint32_t pid, tid;
 	uint32_t size;
 	char data[];
+};
+
+struct perf_sample_regs_user {
+	uint64_t abi;
+  	uint64_t regs[33];
+};
+
+struct perf_sample_stack_user {
+	uint64_t size;
+	char   data[16384];
+	uint64_t dyn_size;
 };
 
 struct perf_sample_lost {
@@ -12775,6 +12814,72 @@ struct perf_sample_lost {
 	uint64_t lost;
 	uint64_t sample_id;
 };
+
+bool ReadFully(int fd, void* data, size_t byte_count) {
+  uint8_t* p = (uint8_t*)data;
+  size_t remaining = byte_count;
+  while (remaining > 0) {
+    ssize_t n = read(fd, p, remaining);
+    if (n <= 0) return false;
+    p += n;
+    remaining -= n;
+  }
+  return true;
+}
+
+bool WriteFully(int fd, void* data, size_t byte_count) {
+  uint8_t* p = (uint8_t*)data;
+  size_t remaining = byte_count;
+  while (remaining > 0) {
+    ssize_t n = write(fd, p, remaining);
+    if (n == -1) return false;
+    p += n;
+    remaining -= n;
+  }
+  return true;
+}
+
+static void print_frame_info(int pid, uint8_t *ptr, int write_size) {
+  fprintf(stderr, "[%s] %d %p %d\n", __FUNCTION__, pid, ptr, write_size);
+
+  int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd == -1) {
+    fprintf(stderr, "cannot socket()!\n");
+  }
+  const char *socket_path = "/dev/socket/mysock";
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+
+  int ret = connect(fd, (struct sockaddr *)(&addr), sizeof(addr));
+  if (ret != 0) {
+    fprintf(stderr, "connect() to %s failed: %s\n", socket_path, strerror(errno));
+  } else {
+    WriteFully(fd, &pid, 4);
+    // write_size += 4;
+    WriteFully(fd, &write_size, 4);
+
+    if (!WriteFully(fd, ptr, write_size)) {
+      fprintf(stderr, "prepare to write %d bytes to socket\n", write_size);
+      close(fd);
+      return;
+    }
+    int frameinfo_size;
+    if (ReadFully(fd, &frameinfo_size, 4)) {
+      unsigned char frame_info[frameinfo_size + 1];
+      if (ReadFully(fd, frame_info, frameinfo_size)) {
+        frame_info[frameinfo_size] = '\0';
+        printf("===================================>Frame:\n");
+        printf("%s\n", frame_info);
+      } else {
+        fprintf(stderr, "Read frame_info from socket error.\n");
+      }
+    } else {
+      fprintf(stderr, "Read frameinfo_size from socket error.\n");
+    }
+    // fprintf(stderr, "Read frame_info from socket placeholder.\n");
+    close(fd);
+  }
+}
 
 static enum bpf_perf_event_ret
 perf_buffer__process_record(struct perf_event_header *e, void *ctx)
@@ -12790,6 +12895,12 @@ perf_buffer__process_record(struct perf_event_header *e, void *ctx)
 	switch (e->type) {
 	case PERF_RECORD_SAMPLE: {
 		struct perf_sample_raw *s = data;
+
+		if (pb->unwind_call_stack){
+			struct perf_sample_regs_user *regs_user = (struct perf_sample_regs_user *)((char*)data + sizeof(struct perf_event_header) + 3*4 + s->size);
+			//struct perf_sample_stack_user *stack_user = (struct perf_sample_stack_user *)((char*)regs_user + sizeof(struct perf_sample_regs_user));
+			print_frame_info(s->pid, (uint8_t*)regs_user, sizeof(struct perf_sample_regs_user) + sizeof(struct perf_sample_stack_user));
+		}
 
 		if (pb->sample_cb)
 			pb->sample_cb(pb->ctx, cpu_buf->cpu, s->data, s->size);
